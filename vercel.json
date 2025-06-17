@@ -1,0 +1,14 @@
+{
+    "builds": [
+        {
+            "src": "get_answers.py",
+            "use": "@vercel/python"
+        }
+    ],
+    "routes": [
+        {
+            "src": "/(.*)",
+            "dest": "get_answers.py"
+        }
+    ]
+}
