@@ -17,10 +17,17 @@ import numpy as np
 import os
 import time
 from pathlib import Path
+
+from dotenv import load_dotenv
 from semantic_text_splitter import MarkdownSplitter
 from tqdm import tqdm
 from google import genai
+import openai
 
+load_dotenv()
+
+openai.api_key=os.getenv("OPENAI_API_KEY")
+openai.base_url="https://aiproxy.sanand.workers.dev/openai/v1/"
 
 class RateLimiter:
     def __init__(self, requests_per_minute=60, requests_per_second=2):
@@ -56,23 +63,19 @@ class RateLimiter:
 
 rate_limiter = RateLimiter(requests_per_minute=5, requests_per_second=2)
 
-
 def get_embedding(text: str, max_retries: int = 3) -> list[float]:
     """Get embedding for text chunk with rate limiting and retry logic"""
-
-    client = genai.Client(api_key=os.environ.get("GENAI_API_KEY"))
 
     for attempt in range(max_retries):
         try:
             # Apply rate limiting
             rate_limiter.wait_if_needed()
 
-            result = client.models.embed_content(
-                model="text-embedding-004",
-                contents=text
+            response = openai.embeddings.create(
+                input=text,
+                model="text-embedding-3-small"  # Or "text-embedding-3-large"
             )
-
-            embedding = result.embeddings[0].values
+            embedding = response.data[0].embedding
             return embedding
 
         except Exception as e:
@@ -100,8 +103,8 @@ def get_chunks(file_path: str, chunk_size: int = 15000):
 
 
 if __name__ == "__main__":
-    # files stores all markdown files in the "markdowns" directory
-    files = [*Path("discourse_md").rglob("*.md"), *Path("tools-in-data-science-public").rglob("*.md")]
+    # files stores all markdown files in the "discourse_md" and "tools-in-data-science-public" directories
+    files = [*Path("discourse_md").rglob("*.md")]
     all_chunks = []
     all_embeddings = []
     total_chunks = 0
@@ -128,4 +131,5 @@ if __name__ == "__main__":
                     continue
 
     # save all the embeddings and chunks to a numpy archive file
-    np.savez("embeddings/embeddings.npz", chunks=all_chunks, embeddings=all_embeddings)
+    np.savez("embeddings/openaiembeddings.npz", chunks=all_chunks, embeddings=all_embeddings)
+

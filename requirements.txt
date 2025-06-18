@@ -8,3 +8,4 @@ tqdm
 uvicorn
 google-genai
 pillow
+openai

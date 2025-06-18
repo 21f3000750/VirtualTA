@@ -9,7 +9,7 @@
 #     "semantic_text_splitter",
 #     "tqdm",
 #     "uvicorn",
-#     "google-genai",
+#     "openai",
 #     "pillow",
 # ]
 # ///
@@ -24,21 +24,29 @@ import re
 import tempfile
 from pathlib import Path
 from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import httpx
 from google import genai
 from google.genai.types import GenerateContentConfig, HttpOptions
-from fastapi.middleware.cors import CORSMiddleware
 import time
+from fastapi.middleware.cors import CORSMiddleware
+from openai import OpenAI
+from fastapi.responses import Response
 
 app = FastAPI()
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # or ["*"] for dev (not production)
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
+)
+
+openai_client = OpenAI(
+    api_key=os.getenv("OPENAI_API_KEY"),
+    base_url="https://aiproxy.sanand.workers.dev/openai/v1/",
+    http_client=httpx.Client(verify=False)
 )
 
 
@@ -77,43 +85,41 @@ class RateLimiter:
 rate_limiter = RateLimiter(requests_per_minute=5, requests_per_second=2)
 
 
-def get_image_description(image_path):
-    """Get a description of the image using Google GenAI."""
-    client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+def get_image_description(image_data_url):
+    """Get a description of the image using OpenAI GPT-4o."""
 
-    filename_hint = "image.png"
-    suffix = os.path.splitext(filename_hint)[-1]
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(image_path)
-        tmp.flush()
-        file_path = tmp.name
-    my_file = client.files.upload(file=file_path)
+    #
 
-    response = client.models.generate_content(
-        model="gemini-2.0-flash",
-        contents=[my_file,
-                  "Describe the content of this image in detail, focusing on any text, objects, or relevant features that could help answer questions about it."],
+    # Call OpenAI API
+    response = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": image_data_url}},
+                    {"type": "text", "text": "Describe the content of this image in detail..."}
+                ]
+            }
+        ],
+        max_tokens=1024
     )
-
-    return response.text
+    return response.choices[0].message.content
 
 
 def get_embedding(text: str, max_retries: int = 3) -> list[float]:
     """Get embedding for text chunk with rate limiting and retry logic"""
-
-    client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY"))
 
     for attempt in range(max_retries):
         try:
             # Apply rate limiting
             rate_limiter.wait_if_needed()
 
-            result = client.models.embed_content(
-                model="text-embedding-004",
-                contents=text
+            response = openai_client.embeddings.create(
+                input=text,
+                model="text-embedding-3-small"  # Or "text-embedding-3-large"
             )
-
-            embedding = result.embeddings[0].values
+            embedding = response.data[0].embedding
             return embedding
 
         except Exception as e:
@@ -134,13 +140,13 @@ def get_embedding(text: str, max_retries: int = 3) -> list[float]:
 
 def load_embeddings():
     """Load chunks and embeddings from npz file"""
-    data = np.load("embeddings/embeddings.npz", allow_pickle=True)
+    data = np.load("embeddings/openaiembeddings.npz", allow_pickle=True)
     return data["chunks"], data["embeddings"]
 
 
 def generate_llm_respose(question: str, context: str):
     """Generate a response from the LLM using the question and context."""
-    client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+    # client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
     # use system prompt to instruct the model to answer based on the context
     system_prompt = """> You are a knowledgeable and concise teaching assistant. Use only the information provided in the context to answer the question.
 >
@@ -161,21 +167,23 @@ def generate_llm_respose(question: str, context: str):
 >
 > Do not attempt to guess, fabricate, or add external information.
 """
-    response = client.models.generate_content(
-        model="gemini-2.0-flash",
-        contents=[
-            system_prompt,
-            f"Context: {context}",
-            f"Question: {question}"
+    response = openai_client.chat.completions.create(
+        model="gpt-4o-mini",  # This is OpenAI's most cost-effective model as of my last update.
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Context: {context}\nQuestion: {question}"}
         ],
-        config=GenerateContentConfig(
-            max_output_tokens=512,
-            temperature=0.5,
-            top_p=0.95,
-            top_k=40
-        ),
+        max_tokens=512,  # Corresponds to max_output_tokens
+        temperature=0.5,
+        top_p=0.95,
+        # top_k is not directly supported in OpenAI's chat completions API,
+        # but top_p often achieves a similar effect.
     )
-    return response.candidates[0].content.parts[0].text
+
+    # Extracting the generated content
+    generated_content = response.choices[0].message.content.strip()
+    return generated_content
+
 
 
 def extract_links_from_text(text):
@@ -200,16 +208,21 @@ def extract_links_from_text(text):
 
     return all_links
 
-
-def answer(question: str,link: str = None, image: str = None):
+def answer(question: str,link:str =None, image: str = None):
     # Load the API key from the environment variable
+    if link:
+        question += f"post-link: {link}"
+
+
     loaded_chunks, loaded_embeddings = load_embeddings()
     if image:
-        image_description = get_image_description(base64.b64decode(image))
-        question += f" {image_description}"
+        image_bytes = base64.b64decode(image)
 
-    if link:
-        question += f"Post Link : {link}"
+        # convert to data URL
+        base64_image = base64.b64encode(image_bytes).decode("utf-8")
+        image_data_url = f"data:image/jpeg;base64,{base64_image}"
+        image_description = get_image_description(image_data_url)
+        question += f" {image_description}"
 
     # Get the embedding for the question
     question_embedding = get_embedding(question)
@@ -224,13 +237,20 @@ def answer(question: str,link: str = None, image: str = None):
 
     response = generate_llm_respose(question, "\n".join(top_chunks))
     links=extract_links_from_text(response)
+    formatted_links = []
+    for url_item in links: # Iterate directly over the unique URLs extracted from the LLM's response
+        formatted_links.append({
+            "text": url_item, # Using the URL itself as the text to satisfy the schema requirement.
+            "url": url_item
+        })
     print(response)
-    return {
-        "question": question,
+    final_response_data = {
         "answer": response,
-        "links": links,
-        "top_chunks": top_chunks
+        "links": formatted_links
     }
+    # Return a JSONResponse object directly
+    return JSONResponse(content=final_response_data)
+
 
 
 @app.post("/api/")
@@ -238,8 +258,10 @@ async def api_answer(request: Request):
     try:
         data = await request.json()
         print(data)
+        print(data.get("question"))
         return answer(data.get("question"),data.get("link"), data.get("image"))
     except Exception as e:
+        print("❌ ERROR OCCURRED:", e)
         return {"error": str(e)}
 
 
